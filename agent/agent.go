@@ -2,27 +2,33 @@ package agent
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 
 	"charm.land/fantasy"
 	"charm.land/fantasy/providers/openaicompat"
 
+	"github.com/user/jsonrpc-server/db"
 	"github.com/user/jsonrpc-server/jsonrpc"
 	"github.com/user/jsonrpc-server/tools"
 )
 
 // Request is the payload for the chat.send JSON-RPC method.
 type Request struct {
-	Prompt string `json:"prompt"`
-	Model  string `json:"model,omitempty"`
+	Prompt    string `json:"prompt"`
+	SessionID string `json:"sessionId,omitempty"`
+	Model     string `json:"model,omitempty"`
 }
 
 // Response is returned after the agent finishes.
 type Response struct {
-	Text  string `json:"text"`
-	Usage Usage  `json:"usage"`
+	Text      string `json:"text"`
+	SessionID string `json:"sessionId"`
+	Usage     Usage  `json:"usage"`
 }
 
 type Usage struct {
@@ -33,12 +39,13 @@ type Usage struct {
 
 // Agent wraps a fantasy agent and manages conversations.
 type Agent struct {
-	mu            sync.Mutex
-	provider      fantasy.Provider
-	defaultModel  string
-	apiKey        string
-	baseURL       string
-	systemPrompt  string
+	mu           sync.Mutex
+	provider     fantasy.Provider
+	database     *db.DB
+	defaultModel string
+	apiKey       string
+	baseURL      string
+	systemPrompt string
 }
 
 // Config holds the initial configuration for the agent.
@@ -47,6 +54,7 @@ type Config struct {
 	BaseURL      string
 	DefaultModel string
 	SystemPrompt string
+	Database     *db.DB
 }
 
 // New creates a new Agent.
@@ -61,6 +69,7 @@ func New(cfg Config) (*Agent, error) {
 
 	return &Agent{
 		provider:     provider,
+		database:     cfg.Database,
 		defaultModel: cfg.DefaultModel,
 		apiKey:       cfg.APIKey,
 		baseURL:      cfg.BaseURL,
@@ -89,6 +98,69 @@ func (a *Agent) SetSystemPrompt(prompt string) {
 	a.systemPrompt = prompt
 }
 
+// GetDatabase returns the database instance.
+func (a *Agent) GetDatabase() *db.DB {
+	return a.database
+}
+
+func generateID() string {
+	b := make([]byte, 8)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// ensureSession returns the session ID, creating a new session if needed.
+func (a *Agent) ensureSession(sessionID, model string) (string, error) {
+	if sessionID != "" {
+		existing, err := a.database.GetSession(sessionID)
+		if err != nil {
+			return "", fmt.Errorf("check session: %w", err)
+		}
+		if existing != nil {
+			return sessionID, nil
+		}
+	}
+
+	// Create new session.
+	if sessionID == "" {
+		sessionID = generateID()
+	}
+	a.mu.Lock()
+	sysPrompt := a.systemPrompt
+	a.mu.Unlock()
+	if _, err := a.database.CreateSession(sessionID, model, sysPrompt); err != nil {
+		return "", fmt.Errorf("create session: %w", err)
+	}
+	return sessionID, nil
+}
+
+// buildHistory loads conversation history from DB and returns fantasy messages.
+func (a *Agent) buildHistory(sessionID string) ([]fantasy.Message, error) {
+	msgs, err := a.database.GetMessages(sessionID)
+	if err != nil {
+		return nil, err
+	}
+
+	var messages []fantasy.Message
+	for _, m := range msgs {
+		switch m.Role {
+		case "user":
+			messages = append(messages, fantasy.NewUserMessage(m.Content))
+		case "assistant":
+			messages = append(messages, fantasy.Message{
+				Role:    fantasy.MessageRoleAssistant,
+				Content: []fantasy.MessagePart{fantasy.TextPart{Text: m.Content}},
+			})
+		case "tool":
+			messages = append(messages, fantasy.Message{
+				Role:    fantasy.MessageRoleTool,
+				Content: []fantasy.MessagePart{fantasy.TextPart{Text: m.Content}},
+			})
+		}
+	}
+	return messages, nil
+}
+
 // Run executes an agent request, streaming notifications via the JSON-RPC server.
 func (a *Agent) Run(ctx context.Context, srv *jsonrpc.Server, req Request) (*Response, error) {
 	a.mu.Lock()
@@ -98,6 +170,23 @@ func (a *Agent) Run(ctx context.Context, srv *jsonrpc.Server, req Request) (*Res
 
 	if req.Model != "" {
 		modelID = req.Model
+	}
+
+	// Ensure session exists.
+	sessionID, err := a.ensureSession(req.SessionID, modelID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Save user message.
+	if _, err := a.database.AddMessage(sessionID, "user", req.Prompt); err != nil {
+		return nil, fmt.Errorf("save user message: %w", err)
+	}
+
+	// Load conversation history.
+	history, err := a.buildHistory(sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("load history: %w", err)
 	}
 
 	model, err := a.provider.LanguageModel(ctx, modelID)
@@ -121,7 +210,7 @@ func (a *Agent) Run(ctx context.Context, srv *jsonrpc.Server, req Request) (*Res
 	var totalUsage Usage
 
 	streamCall := fantasy.AgentStreamCall{
-		Prompt: req.Prompt,
+		Messages: history,
 
 		OnTextDelta: func(id, text string) error {
 			finalText += text
@@ -185,8 +274,27 @@ func (a *Agent) Run(ctx context.Context, srv *jsonrpc.Server, req Request) (*Res
 		TotalTokens:  result.TotalUsage.TotalTokens,
 	}
 
+	// Save assistant response.
+	if finalText != "" {
+		if _, err := a.database.AddMessage(sessionID, "assistant", finalText); err != nil {
+			return nil, fmt.Errorf("save assistant message: %w", err)
+		}
+	}
+
+	// Auto-title: use first 80 chars of first message if title is empty.
+	count, _ := a.database.GetMessageCount(sessionID)
+	if count <= 2 {
+		title := strings.ReplaceAll(req.Prompt, "\n", " ")
+		title = strings.ReplaceAll(title, "\r", "")
+		if len(title) > 80 {
+			title = title[:80] + "..."
+		}
+		a.database.UpdateSessionTitle(sessionID, title)
+	}
+
 	return &Response{
-		Text:  finalText,
-		Usage: totalUsage,
+		Text:      finalText,
+		SessionID: sessionID,
+		Usage:     totalUsage,
 	}, nil
 }

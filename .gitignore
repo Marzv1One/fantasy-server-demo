@@ -15,6 +15,14 @@
 go.work
 go.work.sum
 
+# Database
+*.db
+*.db-wal
+*.db-shm
+
+# Crush
+.crush/
+
 # IDE
 .vscode/
 .idea/
