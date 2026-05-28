@@ -35,6 +35,7 @@ func main() {
 		DefaultModel: "xiaomi/mimo-v2.5",
 		SystemPrompt: "You are a helpful coding assistant. Be concise and direct.",
 		Database:     database,
+		MaxHistory:   100,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to create agent: %v\n", err)

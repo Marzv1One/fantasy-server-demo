@@ -46,6 +46,7 @@ type Agent struct {
 	apiKey       string
 	baseURL      string
 	systemPrompt string
+	maxHistory   int
 }
 
 // Config holds the initial configuration for the agent.
@@ -55,6 +56,7 @@ type Config struct {
 	DefaultModel string
 	SystemPrompt string
 	Database     *db.DB
+	MaxHistory   int // max messages to send to LLM (0 = no limit)
 }
 
 // New creates a new Agent.
@@ -74,6 +76,7 @@ func New(cfg Config) (*Agent, error) {
 		apiKey:       cfg.APIKey,
 		baseURL:      cfg.BaseURL,
 		systemPrompt: cfg.SystemPrompt,
+		maxHistory:   cfg.MaxHistory,
 	}, nil
 }
 
@@ -135,13 +138,30 @@ func (a *Agent) ensureSession(sessionID, model string) (string, error) {
 }
 
 // buildHistory loads conversation history from DB and returns fantasy messages.
+// If maxHistory is set, truncates older messages to stay within the limit.
 func (a *Agent) buildHistory(sessionID string) ([]fantasy.Message, error) {
 	msgs, err := a.database.GetMessages(sessionID)
 	if err != nil {
 		return nil, err
 	}
 
+	// Truncate if history exceeds limit.
+	truncated := false
+	if a.maxHistory > 0 && len(msgs) > a.maxHistory {
+		msgs = msgs[len(msgs)-a.maxHistory:]
+		truncated = true
+	}
+
 	var messages []fantasy.Message
+
+	// Insert a note if we truncated, so the model knows context is partial.
+	if truncated {
+		messages = append(messages, fantasy.Message{
+			Role:    fantasy.MessageRoleSystem,
+			Content: []fantasy.MessagePart{fantasy.TextPart{Text: "Earlier conversation context has been truncated. The following messages are the most recent portion of an ongoing conversation."}},
+		})
+	}
+
 	for _, m := range msgs {
 		switch m.Role {
 		case "user":
