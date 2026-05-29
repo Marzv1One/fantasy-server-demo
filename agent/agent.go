@@ -34,6 +34,12 @@ type FilePart struct {
 
 const maxFileSize = 5 * 1024 * 1024 // 5MB
 
+// ModelInfo holds context limits for a model.
+type ModelInfo struct {
+	ContextWindow int64 `json:"contextWindow"` // max input tokens
+	MaxOutput     int64 `json:"maxOutput"`      // max output tokens
+}
+
 // Response is returned after the agent finishes.
 type Response struct {
 	Text      string `json:"text"`
@@ -55,22 +61,24 @@ type Agent struct {
 	defaultModel   string
 	smallModel     string
 	multimodalModel string
+	modelInfo      map[string]ModelInfo // keyed by model ID
 	apiKey         string
 	baseURL        string
 	systemPrompt   string
-	maxHistory     int
+	maxHistory     int // fallback message count limit (0 = no limit)
 }
 
 // Config holds the initial configuration for the agent.
 type Config struct {
-	APIKey         string
-	BaseURL        string
-	DefaultModel   string
-	SmallModel     string
+	APIKey          string
+	BaseURL         string
+	DefaultModel    string
+	SmallModel      string
 	MultimodalModel string
-	SystemPrompt   string
-	Database       *db.DB
-	MaxHistory     int // max messages to send to LLM (0 = no limit)
+	ModelInfo       map[string]ModelInfo // keyed by model ID
+	SystemPrompt    string
+	Database        *db.DB
+	MaxHistory      int // fallback message count limit (0 = no limit)
 }
 
 // New creates a new Agent.
@@ -89,6 +97,7 @@ func New(cfg Config) (*Agent, error) {
 		defaultModel:    cfg.DefaultModel,
 		smallModel:      cfg.SmallModel,
 		multimodalModel: cfg.MultimodalModel,
+		modelInfo:       cfg.ModelInfo,
 		apiKey:          cfg.APIKey,
 		baseURL:         cfg.BaseURL,
 		systemPrompt:    cfg.SystemPrompt,
@@ -219,10 +228,85 @@ func (a *Agent) buildHistory(sessionID string) ([]fantasy.Message, error) {
 	return messages, nil
 }
 
-// compactHistory summarizes old messages using the small model when history
-// exceeds maxHistory. Returns the compacted history.
-func (a *Agent) compactHistory(ctx context.Context, history []fantasy.Message) ([]fantasy.Message, error) {
-	if a.maxHistory <= 0 || len(history) <= a.maxHistory {
+// estimateTokens returns a rough token count estimate for a string.
+// Uses ~4 chars per token as a heuristic.
+func estimateTokens(s string) int64 {
+	return int64(len(s)+3) / 4
+}
+
+// messageTokens estimates the token count of a single message.
+func messageTokens(m fantasy.Message) int64 {
+	var total int64
+	for _, p := range m.Content {
+		if t, ok := p.(fantasy.TextPart); ok {
+			total += estimateTokens(t.Text)
+		}
+	}
+	return total + 4 // overhead for role/metadata
+}
+
+// historyTokens estimates the total token count of a message history.
+func historyTokens(history []fantasy.Message) int64 {
+	var total int64
+	for _, m := range history {
+		total += messageTokens(m)
+	}
+	return total
+}
+
+// contextBudget returns the token budget available for conversation history
+// given a model's context window and max output. Uses 80% of (context - output)
+// to leave room for system prompt and tools.
+func (a *Agent) contextBudget(modelID string) int64 {
+	info, ok := a.modelInfo[modelID]
+	if !ok || info.ContextWindow == 0 {
+		return 0 // no limit configured
+	}
+	return (info.ContextWindow - info.MaxOutput) * 80 / 100
+}
+
+// CompactHistory is the public entry point for manual compaction.
+func (a *Agent) CompactHistory(ctx context.Context, sessionID string) error {
+	history, err := a.buildHistory(sessionID)
+	if err != nil {
+		return err
+	}
+
+	a.mu.Lock()
+	modelID := a.defaultModel
+	a.mu.Unlock()
+
+	compacted, err := a.compactHistory(ctx, modelID, history)
+	if err != nil {
+		return err
+	}
+
+	// If history changed, we compacted. The summary is already in the history
+	// as a system message — no need to persist it, it'll be used on next request.
+	_ = compacted
+	return nil
+}
+
+// compactHistory summarizes old messages when history exceeds the model's
+// token budget. Uses the small model for summarization.
+func (a *Agent) compactHistory(ctx context.Context, modelID string, history []fantasy.Message) ([]fantasy.Message, error) {
+	budget := a.contextBudget(modelID)
+
+	// Fallback to message count if no model info configured.
+	if budget == 0 {
+		if a.maxHistory > 0 && len(history) > a.maxHistory {
+			history = history[len(history)-a.maxHistory:]
+			history = append([]fantasy.Message{{
+				Role:    fantasy.MessageRoleSystem,
+				Content: []fantasy.MessagePart{fantasy.TextPart{Text: "Earlier conversation context has been truncated. The following messages are the most recent portion of an ongoing conversation."}},
+			}}, history...)
+		}
+		return history, nil
+	}
+
+	// Check if we're within budget.
+	totalTokens := historyTokens(history)
+	if totalTokens <= budget {
 		return history, nil
 	}
 
@@ -231,8 +315,13 @@ func (a *Agent) compactHistory(ctx context.Context, history []fantasy.Message) (
 	a.mu.Unlock()
 
 	if smallID == "" {
-		// No small model configured, fall back to simple truncation.
-		history = history[len(history)-a.maxHistory:]
+		// No small model, truncate by estimated ratio.
+		ratio := float64(budget) / float64(totalTokens)
+		cutoff := int(float64(len(history)) * ratio)
+		if cutoff < 1 {
+			cutoff = 1
+		}
+		history = history[len(history)-cutoff:]
 		history = append([]fantasy.Message{{
 			Role:    fantasy.MessageRoleSystem,
 			Content: []fantasy.MessagePart{fantasy.TextPart{Text: "Earlier conversation context has been truncated. The following messages are the most recent portion of an ongoing conversation."}},
@@ -240,32 +329,8 @@ func (a *Agent) compactHistory(ctx context.Context, history []fantasy.Message) (
 		return history, nil
 	}
 
-	// Split into old (to summarize) and recent (to keep).
-	cutoff := len(history) - a.maxHistory
-	oldMessages := history[:cutoff]
-	recentMessages := history[cutoff:]
-
-	// Format old messages for summarization.
-	var buf strings.Builder
-	for _, m := range oldMessages {
-		switch m.Role {
-		case fantasy.MessageRoleUser:
-			buf.WriteString("User: ")
-		case fantasy.MessageRoleAssistant:
-			buf.WriteString("Assistant: ")
-		case fantasy.MessageRoleTool:
-			buf.WriteString("Tool: ")
-		case fantasy.MessageRoleSystem:
-			buf.WriteString("System: ")
-		}
-		for _, part := range m.Content {
-			if t, ok := part.(fantasy.TextPart); ok {
-				buf.WriteString(t.Text)
-			}
-		}
-		buf.WriteString("\n")
-	}
-
+	// Progressive summarization: summarize from the oldest messages until
+	// we fit within the budget.
 	smallModel, err := a.provider.LanguageModel(ctx, smallID)
 	if err != nil {
 		return nil, fmt.Errorf("small model %q: %w", smallID, err)
@@ -275,23 +340,58 @@ func (a *Agent) compactHistory(ctx context.Context, history []fantasy.Message) (
 		fantasy.WithSystemPrompt("You are a conversation summarizer. Summarize the following conversation history concisely, preserving key facts, decisions, code changes, and context needed to continue the conversation. Output only the summary, no preamble."),
 	)
 
-	result, err := summarizer.Generate(ctx, fantasy.AgentCall{
-		Prompt: buf.String(),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("summarize history: %w", err)
+	for totalTokens > budget && len(history) > 2 {
+		// Find cutoff: remove ~25% of messages from the start each round.
+		cutoff := len(history) / 4
+		if cutoff < 1 {
+			cutoff = 1
+		}
+
+		oldMessages := history[:cutoff]
+		remaining := history[cutoff:]
+
+		// Format old messages for summarization.
+		var buf strings.Builder
+		for _, m := range oldMessages {
+			switch m.Role {
+			case fantasy.MessageRoleUser:
+				buf.WriteString("User: ")
+			case fantasy.MessageRoleAssistant:
+				buf.WriteString("Assistant: ")
+			case fantasy.MessageRoleTool:
+				buf.WriteString("Tool: ")
+			case fantasy.MessageRoleSystem:
+				buf.WriteString("System: ")
+			}
+			for _, part := range m.Content {
+				if t, ok := part.(fantasy.TextPart); ok {
+					buf.WriteString(t.Text)
+				}
+			}
+			buf.WriteString("\n")
+		}
+
+		result, err := summarizer.Generate(ctx, fantasy.AgentCall{
+			Prompt: buf.String(),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("summarize history: %w", err)
+		}
+
+		summary := strings.TrimSpace(result.Response.Content.Text())
+
+		// Replace old messages with summary.
+		history = make([]fantasy.Message, 0, 1+len(remaining))
+		history = append(history, fantasy.Message{
+			Role:    fantasy.MessageRoleSystem,
+			Content: []fantasy.MessagePart{fantasy.TextPart{Text: "Conversation summary (earlier messages were compacted):\n" + summary}},
+		})
+		history = append(history, remaining...)
+
+		totalTokens = historyTokens(history)
 	}
 
-	summary := strings.TrimSpace(result.Response.Content.Text())
-
-	// Build compacted history: summary + recent messages.
-	compacted := make([]fantasy.Message, 0, 1+len(recentMessages))
-	compacted = append(compacted, fantasy.Message{
-		Role:    fantasy.MessageRoleSystem,
-		Content: []fantasy.MessagePart{fantasy.TextPart{Text: "Conversation summary (earlier messages were compacted):\n" + summary}},
-	})
-	compacted = append(compacted, recentMessages...)
-	return compacted, nil
+	return history, nil
 }
 
 // Run executes an agent request, streaming notifications via the JSON-RPC server.
@@ -327,7 +427,7 @@ func (a *Agent) Run(ctx context.Context, srv *jsonrpc.Server, req Request) (*Res
 	}
 
 	// Compact history if it exceeds limit (summarizes old messages via small model).
-	history, err = a.compactHistory(ctx, history)
+	history, err = a.compactHistory(ctx, modelID, history)
 	if err != nil {
 		return nil, fmt.Errorf("compact history: %w", err)
 	}

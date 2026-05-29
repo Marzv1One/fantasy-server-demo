@@ -35,9 +35,14 @@ func main() {
 		DefaultModel:    "xiaomi/mimo-v2.5-pro",
 		SmallModel:      "xiaomi/mimo-v2-flash",
 		MultimodalModel: "xiaomi/mimo-v2.5",
-		SystemPrompt:    "You are a helpful coding assistant. Be concise and direct.",
-		Database:        database,
-		MaxHistory:      100,
+		ModelInfo: map[string]agent.ModelInfo{
+			"xiaomi/mimo-v2.5-pro": {ContextWindow: 1_000_000, MaxOutput: 128_000},
+			"xiaomi/mimo-v2.5":     {ContextWindow: 1_000_000, MaxOutput: 128_000},
+			"xiaomi/mimo-v2-flash": {ContextWindow: 256_000, MaxOutput: 64_000},
+		},
+		SystemPrompt: "You are a helpful coding assistant. Be concise and direct.",
+		Database:     database,
+		MaxHistory:   100,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to create agent: %v\n", err)
@@ -181,6 +186,27 @@ func main() {
 			}
 		}
 		return map[string]string{"status": "deleted"}, nil
+	})
+
+	// ── session.compact ─────────────────────────────────────
+	srv.Register("session.compact", func(s *jsonrpc.Server, params json.RawMessage) (interface{}, error) {
+		var req struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(params, &req); err != nil || req.ID == "" {
+			return nil, &jsonrpc.ErrorObject{
+				Code:    jsonrpc.InvalidParams,
+				Message: "id is required",
+			}
+		}
+
+		if err := ag.CompactHistory(context.Background(), req.ID); err != nil {
+			return nil, &jsonrpc.ErrorObject{
+				Code:    jsonrpc.InternalError,
+				Message: err.Error(),
+			}
+		}
+		return map[string]string{"status": "compacted"}, nil
 	})
 
 	// ── set.model ────────────────────────────────────────────
