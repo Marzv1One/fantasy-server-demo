@@ -30,12 +30,14 @@ func main() {
 	defer database.Close()
 
 	ag, err := agent.New(agent.Config{
-		APIKey:       apiKey,
-		BaseURL:      "https://token-plan-sgp.xiaomimimo.com/v1",
-		DefaultModel: "xiaomi/mimo-v2.5",
-		SystemPrompt: "You are a helpful coding assistant. Be concise and direct.",
-		Database:     database,
-		MaxHistory:   100,
+		APIKey:          apiKey,
+		BaseURL:         "https://token-plan-sgp.xiaomimimo.com/v1",
+		DefaultModel:    "xiaomi/mimo-v2.5-pro",
+		SmallModel:      "xiaomi/mimo-v2-flash",
+		MultimodalModel: "xiaomi/mimo-v2.5",
+		SystemPrompt:    "You are a helpful coding assistant. Be concise and direct.",
+		Database:        database,
+		MaxHistory:      100,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to create agent: %v\n", err)
@@ -185,6 +187,7 @@ func main() {
 	srv.Register("set.model", func(s *jsonrpc.Server, params json.RawMessage) (interface{}, error) {
 		var req struct {
 			Model string `json:"model"`
+			Role  string `json:"role,omitempty"` // "primary" (default), "small", or "multimodal"
 		}
 		if err := json.Unmarshal(params, &req); err != nil {
 			return nil, &jsonrpc.ErrorObject{
@@ -193,8 +196,20 @@ func main() {
 				Data:    err.Error(),
 			}
 		}
-		ag.SetDefaultModel(req.Model)
-		return map[string]string{"model": req.Model}, nil
+		switch req.Role {
+		case "small":
+			ag.SetSmallModel(req.Model)
+		case "multimodal":
+			ag.SetMultimodalModel(req.Model)
+		default:
+			ag.SetDefaultModel(req.Model)
+		}
+		return map[string]string{"role": req.Role, "model": req.Model}, nil
+	})
+
+	// ── get.models ──────────────────────────────────────────
+	srv.Register("get.models", func(s *jsonrpc.Server, params json.RawMessage) (interface{}, error) {
+		return ag.GetModels(), nil
 	})
 
 	// ── set.systemPrompt ─────────────────────────────────────

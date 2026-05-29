@@ -19,10 +19,20 @@ import (
 
 // Request is the payload for the chat.send JSON-RPC method.
 type Request struct {
-	Prompt    string `json:"prompt"`
-	SessionID string `json:"sessionId,omitempty"`
-	Model     string `json:"model,omitempty"`
+	Prompt    string     `json:"prompt"`
+	SessionID string     `json:"sessionId,omitempty"`
+	Model     string     `json:"model,omitempty"`
+	Files     []FilePart `json:"files,omitempty"`
 }
+
+// FilePart is a base64-encoded file attachment.
+type FilePart struct {
+	Filename  string `json:"filename"`
+	Data      []byte `json:"data"`
+	MediaType string `json:"mediaType"`
+}
+
+const maxFileSize = 5 * 1024 * 1024 // 5MB
 
 // Response is returned after the agent finishes.
 type Response struct {
@@ -39,24 +49,28 @@ type Usage struct {
 
 // Agent wraps a fantasy agent and manages conversations.
 type Agent struct {
-	mu           sync.Mutex
-	provider     fantasy.Provider
-	database     *db.DB
-	defaultModel string
-	apiKey       string
-	baseURL      string
-	systemPrompt string
-	maxHistory   int
+	mu             sync.Mutex
+	provider       fantasy.Provider
+	database       *db.DB
+	defaultModel   string
+	smallModel     string
+	multimodalModel string
+	apiKey         string
+	baseURL        string
+	systemPrompt   string
+	maxHistory     int
 }
 
 // Config holds the initial configuration for the agent.
 type Config struct {
-	APIKey       string
-	BaseURL      string
-	DefaultModel string
-	SystemPrompt string
-	Database     *db.DB
-	MaxHistory   int // max messages to send to LLM (0 = no limit)
+	APIKey         string
+	BaseURL        string
+	DefaultModel   string
+	SmallModel     string
+	MultimodalModel string
+	SystemPrompt   string
+	Database       *db.DB
+	MaxHistory     int // max messages to send to LLM (0 = no limit)
 }
 
 // New creates a new Agent.
@@ -70,13 +84,15 @@ func New(cfg Config) (*Agent, error) {
 	}
 
 	return &Agent{
-		provider:     provider,
-		database:     cfg.Database,
-		defaultModel: cfg.DefaultModel,
-		apiKey:       cfg.APIKey,
-		baseURL:      cfg.BaseURL,
-		systemPrompt: cfg.SystemPrompt,
-		maxHistory:   cfg.MaxHistory,
+		provider:        provider,
+		database:        cfg.Database,
+		defaultModel:    cfg.DefaultModel,
+		smallModel:      cfg.SmallModel,
+		multimodalModel: cfg.MultimodalModel,
+		apiKey:          cfg.APIKey,
+		baseURL:         cfg.BaseURL,
+		systemPrompt:    cfg.SystemPrompt,
+		maxHistory:      cfg.MaxHistory,
 	}, nil
 }
 
@@ -92,6 +108,45 @@ func (a *Agent) GetDefaultModel() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.defaultModel
+}
+
+// SetSmallModel changes the small/fast model.
+func (a *Agent) SetSmallModel(model string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.smallModel = model
+}
+
+// GetSmallModel returns the current small model.
+func (a *Agent) GetSmallModel() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.smallModel
+}
+
+// SetMultimodalModel changes the multimodal model.
+func (a *Agent) SetMultimodalModel(model string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.multimodalModel = model
+}
+
+// GetMultimodalModel returns the current multimodal model.
+func (a *Agent) GetMultimodalModel() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.multimodalModel
+}
+
+// GetModels returns the current model configuration.
+func (a *Agent) GetModels() map[string]string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return map[string]string{
+		"primary":    a.defaultModel,
+		"small":      a.smallModel,
+		"multimodal": a.multimodalModel,
+	}
 }
 
 // SetSystemPrompt changes the system prompt.
@@ -185,11 +240,15 @@ func (a *Agent) buildHistory(sessionID string) ([]fantasy.Message, error) {
 func (a *Agent) Run(ctx context.Context, srv *jsonrpc.Server, req Request) (*Response, error) {
 	a.mu.Lock()
 	modelID := a.defaultModel
+	multimodalID := a.multimodalModel
 	systemPrompt := a.systemPrompt
 	a.mu.Unlock()
 
 	if req.Model != "" {
 		modelID = req.Model
+	} else if len(req.Files) > 0 && multimodalID != "" {
+		// Auto-select multimodal model when files are attached.
+		modelID = multimodalID
 	}
 
 	// Ensure session exists.
@@ -229,8 +288,34 @@ func (a *Agent) Run(ctx context.Context, srv *jsonrpc.Server, req Request) (*Res
 	var finalText string
 	var totalUsage Usage
 
+	// Convert request files to fantasy FileParts, validating size.
+	var files []fantasy.FilePart
+	for _, f := range req.Files {
+		if len(f.Data) > maxFileSize {
+			return nil, fmt.Errorf("file %q exceeds 5MB limit (%d bytes)", f.Filename, len(f.Data))
+		}
+		files = append(files, fantasy.FilePart{
+			Filename:  f.Filename,
+			Data:      f.Data,
+			MediaType: f.MediaType,
+		})
+	}
+
+	// When files are present, the fantasy framework requires Prompt to be set.
+	// We also remove the last user message from history to avoid duplication,
+	// since the framework will create a user message from Prompt + Files.
+	streamPrompt := ""
+	if len(files) > 0 {
+		streamPrompt = req.Prompt
+		if len(history) > 0 && history[len(history)-1].Role == fantasy.MessageRoleUser {
+			history = history[:len(history)-1]
+		}
+	}
+
 	streamCall := fantasy.AgentStreamCall{
+		Prompt:   streamPrompt,
 		Messages: history,
+		Files:    files,
 
 		OnTextDelta: func(id, text string) error {
 			finalText += text
