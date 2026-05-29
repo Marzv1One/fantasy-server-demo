@@ -206,3 +206,16 @@ func (db *DB) GetMessageCount(sessionID string) (int, error) {
 	err := db.conn.QueryRow(`SELECT COUNT(*) FROM messages WHERE session_id = ?`, sessionID).Scan(&count)
 	return count, err
 }
+
+// DeleteMessagesBefore deletes all messages with id < beforeID for a session.
+func (db *DB) DeleteMessagesBefore(sessionID string, beforeID int64) (int64, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	res, err := db.conn.Exec(`DELETE FROM messages WHERE session_id = ? AND id < ?`, sessionID, beforeID)
+	if err != nil {
+		return 0, fmt.Errorf("delete messages: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	_ = db.touchSession(sessionID)
+	return n, nil
+}

@@ -201,6 +201,33 @@ func (a *Agent) ensureSession(sessionID, model string) (string, error) {
 	return sessionID, nil
 }
 
+// msgsToFantasy converts db messages to fantasy messages.
+func msgsToFantasy(msgs []db.Message) []fantasy.Message {
+	var messages []fantasy.Message
+	for _, m := range msgs {
+		switch m.Role {
+		case "user":
+			messages = append(messages, fantasy.NewUserMessage(m.Content))
+		case "assistant":
+			messages = append(messages, fantasy.Message{
+				Role:    fantasy.MessageRoleAssistant,
+				Content: []fantasy.MessagePart{fantasy.TextPart{Text: m.Content}},
+			})
+		case "tool":
+			messages = append(messages, fantasy.Message{
+				Role:    fantasy.MessageRoleTool,
+				Content: []fantasy.MessagePart{fantasy.TextPart{Text: m.Content}},
+			})
+		case "system":
+			messages = append(messages, fantasy.Message{
+				Role:    fantasy.MessageRoleSystem,
+				Content: []fantasy.MessagePart{fantasy.TextPart{Text: m.Content}},
+			})
+		}
+	}
+	return messages
+}
+
 // buildHistory loads conversation history from DB and returns fantasy messages.
 func (a *Agent) buildHistory(sessionID string) ([]fantasy.Message, error) {
 	msgs, err := a.database.GetMessages(sessionID)
@@ -266,24 +293,127 @@ func (a *Agent) contextBudget(modelID string) int64 {
 }
 
 // CompactHistory is the public entry point for manual compaction.
+// It summarizes old messages with the small model and persists the result.
 func (a *Agent) CompactHistory(ctx context.Context, sessionID string) error {
-	history, err := a.buildHistory(sessionID)
+	// Load raw messages with IDs for deletion.
+	rawMsgs, err := a.database.GetMessages(sessionID)
 	if err != nil {
 		return err
+	}
+	if len(rawMsgs) == 0 {
+		return nil
 	}
 
 	a.mu.Lock()
 	modelID := a.defaultModel
+	smallID := a.smallModel
 	a.mu.Unlock()
 
-	compacted, err := a.compactHistory(ctx, modelID, history)
-	if err != nil {
-		return err
+	budget := a.contextBudget(modelID)
+	if budget == 0 {
+		if a.maxHistory <= 0 || len(rawMsgs) <= a.maxHistory {
+			return nil
+		}
 	}
 
-	// If history changed, we compacted. The summary is already in the history
-	// as a system message — no need to persist it, it'll be used on next request.
-	_ = compacted
+	// Convert to fantasy messages for token estimation.
+	history := msgsToFantasy(rawMsgs)
+	totalTokens := historyTokens(history)
+
+	// Check if compaction is needed.
+	if budget > 0 && totalTokens <= budget {
+		return nil
+	}
+	if budget == 0 && (a.maxHistory <= 0 || len(history) <= a.maxHistory) {
+		return nil
+	}
+
+	if smallID == "" {
+		return fmt.Errorf("no small model configured for summarization")
+	}
+
+	smallModel, err := a.provider.LanguageModel(ctx, smallID)
+	if err != nil {
+		return fmt.Errorf("small model %q: %w", smallID, err)
+	}
+
+	summarizer := fantasy.NewAgent(smallModel,
+		fantasy.WithSystemPrompt("You are a conversation summarizer. Summarize the following conversation history concisely, preserving key facts, decisions, code changes, and context needed to continue the conversation. Output only the summary, no preamble."),
+	)
+
+	// Progressive summarization: summarize 25% per round until under budget.
+	for {
+		needCompact := false
+		if budget > 0 {
+			needCompact = totalTokens > budget
+		} else {
+			needCompact = len(history) > a.maxHistory
+		}
+		if !needCompact || len(history) <= 2 {
+			break
+		}
+
+		cutoff := len(history) / 4
+		if cutoff < 1 {
+			cutoff = 1
+		}
+
+		// Format old messages for summarization.
+		var buf strings.Builder
+		for _, m := range history[:cutoff] {
+			switch m.Role {
+			case fantasy.MessageRoleUser:
+				buf.WriteString("User: ")
+			case fantasy.MessageRoleAssistant:
+				buf.WriteString("Assistant: ")
+			case fantasy.MessageRoleTool:
+				buf.WriteString("Tool: ")
+			case fantasy.MessageRoleSystem:
+				buf.WriteString("System: ")
+			}
+			for _, part := range m.Content {
+				if t, ok := part.(fantasy.TextPart); ok {
+					buf.WriteString(t.Text)
+				}
+			}
+			buf.WriteString("\n")
+		}
+
+		result, err := summarizer.Generate(ctx, fantasy.AgentCall{
+			Prompt: buf.String(),
+		})
+		if err != nil {
+			return fmt.Errorf("summarize history: %w", err)
+		}
+
+		summary := strings.TrimSpace(result.Response.Content.Text())
+
+		// Delete old messages from DB.
+		keepFromID := rawMsgs[cutoff].ID
+		deleted, err := a.database.DeleteMessagesBefore(sessionID, keepFromID)
+		if err != nil {
+			return fmt.Errorf("delete old messages: %w", err)
+		}
+
+		// Insert summary as system message.
+		if _, err := a.database.AddMessage(sessionID, "system", "Conversation summary (earlier messages were compacted):\n"+summary); err != nil {
+			return fmt.Errorf("save summary: %w", err)
+		}
+
+		// Update in-memory state for next iteration.
+		remaining := history[cutoff:]
+		history = make([]fantasy.Message, 0, 1+len(remaining))
+		history = append(history, fantasy.Message{
+			Role:    fantasy.MessageRoleSystem,
+			Content: []fantasy.MessagePart{fantasy.TextPart{Text: "Conversation summary (earlier messages were compacted):\n" + summary}},
+		})
+		history = append(history, remaining...)
+		rawMsgs = rawMsgs[cutoff:]
+		totalTokens = historyTokens(history)
+
+		_ = deleted // consumed by the DB method
+	}
+
 	return nil
 }
 
