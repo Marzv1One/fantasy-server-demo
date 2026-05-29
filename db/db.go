@@ -48,6 +48,7 @@ func (db *DB) migrate() error {
 			session_id   TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
 			role         TEXT NOT NULL CHECK(role IN ('user','assistant','tool','system')),
 			content      TEXT NOT NULL DEFAULT '',
+			model        TEXT NOT NULL DEFAULT '',
 			tool_name    TEXT NOT NULL DEFAULT '',
 			tool_call_id TEXT NOT NULL DEFAULT '',
 			created_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -55,7 +56,33 @@ func (db *DB) migrate() error {
 
 		CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// Add model column to existing databases if missing.
+	var hasModel bool
+	rows, err := db.conn.Query(`PRAGMA table_info(messages)`)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var cid int
+			var name, ctype string
+			var notnull int
+			var dflt sql.NullString
+			var pk int
+			if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err == nil && name == "model" {
+				hasModel = true
+				break
+			}
+		}
+	}
+	if !hasModel {
+		if _, err := db.conn.Exec(`ALTER TABLE messages ADD COLUMN model TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("migrate model column: %w", err)
+		}
+	}
+	return nil
 }
 
 // ── Session ────────────────────────────────────────────────
@@ -156,34 +183,35 @@ type Message struct {
 	SessionID  string    `json:"sessionId"`
 	Role       string    `json:"role"`
 	Content    string    `json:"content"`
+	Model      string    `json:"model,omitempty"`
 	ToolName   string    `json:"toolName,omitempty"`
 	ToolCallID string    `json:"toolCallId,omitempty"`
 	CreatedAt  time.Time `json:"createdAt"`
 }
 
 func (db *DB) AddMessage(sessionID, role, content string) (*Message, error) {
-	return db.AddMessageWithTool(sessionID, role, content, "", "")
+	return db.AddMessageWithTool(sessionID, role, content, "", "", "")
 }
 
-func (db *DB) AddMessageWithTool(sessionID, role, content, toolName, toolCallID string) (*Message, error) {
+func (db *DB) AddMessageWithTool(sessionID, role, content, model, toolName, toolCallID string) (*Message, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	now := time.Now()
 	res, err := db.conn.Exec(
-		`INSERT INTO messages (session_id, role, content, tool_name, tool_call_id, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
-		sessionID, role, content, toolName, toolCallID, now,
+		`INSERT INTO messages (session_id, role, content, model, tool_name, tool_call_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		sessionID, role, content, model, toolName, toolCallID, now,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("add message: %w", err)
 	}
 	id, _ := res.LastInsertId()
 	_ = db.touchSession(sessionID)
-	return &Message{ID: id, SessionID: sessionID, Role: role, Content: content, ToolName: toolName, ToolCallID: toolCallID, CreatedAt: now}, nil
+	return &Message{ID: id, SessionID: sessionID, Role: role, Content: content, Model: model, ToolName: toolName, ToolCallID: toolCallID, CreatedAt: now}, nil
 }
 
 func (db *DB) GetMessages(sessionID string) ([]Message, error) {
 	rows, err := db.conn.Query(
-		`SELECT id, session_id, role, content, tool_name, tool_call_id, created_at FROM messages WHERE session_id = ? ORDER BY id ASC`, sessionID,
+		`SELECT id, session_id, role, content, model, tool_name, tool_call_id, created_at FROM messages WHERE session_id = ? ORDER BY id ASC`, sessionID,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("get messages: %w", err)
@@ -193,12 +221,48 @@ func (db *DB) GetMessages(sessionID string) ([]Message, error) {
 	var msgs []Message
 	for rows.Next() {
 		var m Message
-		if err := rows.Scan(&m.ID, &m.SessionID, &m.Role, &m.Content, &m.ToolName, &m.ToolCallID, &m.CreatedAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.SessionID, &m.Role, &m.Content, &m.Model, &m.ToolName, &m.ToolCallID, &m.CreatedAt); err != nil {
 			return nil, err
 		}
 		msgs = append(msgs, m)
 	}
 	return msgs, rows.Err()
+}
+
+// GetMessagesPaginated returns messages with limit/offset pagination.
+// offset=0, limit=0 returns all messages.
+func (db *DB) GetMessagesPaginated(sessionID string, offset, limit int) ([]Message, int, error) {
+	// Get total count.
+	total, err := db.GetMessageCount(sessionID)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	if limit <= 0 {
+		limit = total
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	rows, err := db.conn.Query(
+		`SELECT id, session_id, role, content, model, tool_name, tool_call_id, created_at FROM messages WHERE session_id = ? ORDER BY id ASC LIMIT ? OFFSET ?`,
+		sessionID, limit, offset,
+	)
+	if err != nil {
+		return nil, 0, fmt.Errorf("get messages paginated: %w", err)
+	}
+	defer rows.Close()
+
+	var msgs []Message
+	for rows.Next() {
+		var m Message
+		if err := rows.Scan(&m.ID, &m.SessionID, &m.Role, &m.Content, &m.Model, &m.ToolName, &m.ToolCallID, &m.CreatedAt); err != nil {
+			return nil, 0, err
+		}
+		msgs = append(msgs, m)
+	}
+	return msgs, total, rows.Err()
 }
 
 func (db *DB) GetMessageCount(sessionID string) (int, error) {

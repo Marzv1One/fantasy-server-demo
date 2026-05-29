@@ -34,6 +34,17 @@ type FilePart struct {
 
 const maxFileSize = 5 * 1024 * 1024 // 5MB
 
+// supportedMediaTypes lists accepted MIME types (empty = accept all).
+var supportedMediaTypes = map[string]bool{
+	"image/png":    true,
+	"image/jpeg":   true,
+	"image/gif":    true,
+	"image/webp":   true,
+	"audio/wav":    true,
+	"audio/mpeg":   true,
+	"audio/mp3":    true,
+}
+
 // ModelInfo holds context limits for a model.
 type ModelInfo struct {
 	ContextWindow int64 `json:"contextWindow"` // max input tokens
@@ -292,9 +303,12 @@ func (a *Agent) contextBudget(modelID string) int64 {
 	return (info.ContextWindow - info.MaxOutput) * 80 / 100
 }
 
+// CompactProgressFunc is called during compaction to report progress.
+type CompactProgressFunc func(stage string, detail string)
+
 // CompactHistory is the public entry point for manual compaction.
 // It summarizes old messages with the small model and persists the result.
-func (a *Agent) CompactHistory(ctx context.Context, sessionID string) error {
+func (a *Agent) CompactHistory(ctx context.Context, sessionID string, onProgress CompactProgressFunc) error {
 	// Load raw messages with IDs for deletion.
 	rawMsgs, err := a.database.GetMessages(sessionID)
 	if err != nil {
@@ -330,6 +344,10 @@ func (a *Agent) CompactHistory(ctx context.Context, sessionID string) error {
 
 	if smallID == "" {
 		return fmt.Errorf("no small model configured for summarization")
+	}
+
+	if onProgress != nil {
+		onProgress("starting", fmt.Sprintf("%d messages, %d tokens, budget %d", len(rawMsgs), totalTokens, budget))
 	}
 
 	smallModel, err := a.provider.LanguageModel(ctx, smallID)
@@ -379,6 +397,10 @@ func (a *Agent) CompactHistory(ctx context.Context, sessionID string) error {
 			buf.WriteString("\n")
 		}
 
+		if onProgress != nil {
+			onProgress("summarizing", fmt.Sprintf("compacting %d/%d messages (round %d tokens)", cutoff, len(history)+cutoff, totalTokens))
+		}
+
 		result, err := summarizer.Generate(ctx, fantasy.AgentCall{
 			Prompt: buf.String(),
 		})
@@ -412,6 +434,10 @@ func (a *Agent) CompactHistory(ctx context.Context, sessionID string) error {
 		totalTokens = historyTokens(history)
 
 		_ = deleted // consumed by the DB method
+	}
+
+	if onProgress != nil {
+		onProgress("done", fmt.Sprintf("%d messages remaining, %d tokens", len(history), totalTokens))
 	}
 
 	return nil
@@ -582,11 +608,14 @@ func (a *Agent) Run(ctx context.Context, srv *jsonrpc.Server, req Request) (*Res
 	var finalText string
 	var totalUsage Usage
 
-	// Convert request files to fantasy FileParts, validating size.
+	// Convert request files to fantasy FileParts, validating size and type.
 	var files []fantasy.FilePart
 	for _, f := range req.Files {
 		if len(f.Data) > maxFileSize {
 			return nil, fmt.Errorf("file %q exceeds 5MB limit (%d bytes)", f.Filename, len(f.Data))
+		}
+		if f.MediaType != "" && !supportedMediaTypes[f.MediaType] {
+			return nil, fmt.Errorf("file %q has unsupported media type %q", f.Filename, f.MediaType)
 		}
 		files = append(files, fantasy.FilePart{
 			Filename:  f.Filename,
@@ -675,7 +704,7 @@ func (a *Agent) Run(ctx context.Context, srv *jsonrpc.Server, req Request) (*Res
 
 	// Save assistant response.
 	if finalText != "" {
-		if _, err := a.database.AddMessage(sessionID, "assistant", finalText); err != nil {
+		if _, err := a.database.AddMessageWithTool(sessionID, "assistant", finalText, modelID, "", ""); err != nil {
 			return nil, fmt.Errorf("save assistant message: %w", err)
 		}
 	}

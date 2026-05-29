@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/user/jsonrpc-server/agent"
 	"github.com/user/jsonrpc-server/db"
@@ -130,7 +131,9 @@ func main() {
 	// ── session.get ──────────────────────────────────────────
 	srv.Register("session.get", func(s *jsonrpc.Server, params json.RawMessage) (interface{}, error) {
 		var req struct {
-			ID string `json:"id"`
+			ID     string `json:"id"`
+			Offset int    `json:"offset,omitempty"`
+			Limit  int    `json:"limit,omitempty"`
 		}
 		if err := json.Unmarshal(params, &req); err != nil || req.ID == "" {
 			return nil, &jsonrpc.ErrorObject{
@@ -153,7 +156,7 @@ func main() {
 			}
 		}
 
-		messages, err := ag.GetDatabase().GetMessages(req.ID)
+		messages, total, err := ag.GetDatabase().GetMessagesPaginated(req.ID, req.Offset, req.Limit)
 		if err != nil {
 			return nil, &jsonrpc.ErrorObject{
 				Code:    jsonrpc.InternalError,
@@ -164,6 +167,9 @@ func main() {
 		return map[string]any{
 			"session":  session,
 			"messages": messages,
+			"total":    total,
+			"offset":   req.Offset,
+			"limit":    req.Limit,
 		}, nil
 	})
 
@@ -188,6 +194,30 @@ func main() {
 		return map[string]string{"status": "deleted"}, nil
 	})
 
+	// ── session.rename ───────────────────────────────────────
+	srv.Register("session.rename", func(s *jsonrpc.Server, params json.RawMessage) (interface{}, error) {
+		var req struct {
+			ID    string `json:"id"`
+			Title string `json:"title"`
+		}
+		if err := json.Unmarshal(params, &req); err != nil || req.ID == "" || req.Title == "" {
+			return nil, &jsonrpc.ErrorObject{
+				Code:    jsonrpc.InvalidParams,
+				Message: "id and title are required",
+			}
+		}
+
+		title := strings.ReplaceAll(req.Title, "\n", " ")
+		title = strings.ReplaceAll(title, "\r", "")
+		if err := ag.GetDatabase().UpdateSessionTitle(req.ID, title); err != nil {
+			return nil, &jsonrpc.ErrorObject{
+				Code:    jsonrpc.InternalError,
+				Message: err.Error(),
+			}
+		}
+		return map[string]string{"status": "renamed", "title": title}, nil
+	})
+
 	// ── session.compact ─────────────────────────────────────
 	srv.Register("session.compact", func(s *jsonrpc.Server, params json.RawMessage) (interface{}, error) {
 		var req struct {
@@ -200,7 +230,13 @@ func main() {
 			}
 		}
 
-		if err := ag.CompactHistory(context.Background(), req.ID); err != nil {
+		if err := ag.CompactHistory(context.Background(), req.ID, func(stage, detail string) {
+			s.Notify("session.compactProgress", map[string]any{
+				"sessionId": req.ID,
+				"stage":     stage,
+				"detail":    detail,
+			})
+		}); err != nil {
 			return nil, &jsonrpc.ErrorObject{
 				Code:    jsonrpc.InternalError,
 				Message: err.Error(),
