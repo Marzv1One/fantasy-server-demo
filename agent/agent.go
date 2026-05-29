@@ -193,30 +193,13 @@ func (a *Agent) ensureSession(sessionID, model string) (string, error) {
 }
 
 // buildHistory loads conversation history from DB and returns fantasy messages.
-// If maxHistory is set, truncates older messages to stay within the limit.
 func (a *Agent) buildHistory(sessionID string) ([]fantasy.Message, error) {
 	msgs, err := a.database.GetMessages(sessionID)
 	if err != nil {
 		return nil, err
 	}
 
-	// Truncate if history exceeds limit.
-	truncated := false
-	if a.maxHistory > 0 && len(msgs) > a.maxHistory {
-		msgs = msgs[len(msgs)-a.maxHistory:]
-		truncated = true
-	}
-
 	var messages []fantasy.Message
-
-	// Insert a note if we truncated, so the model knows context is partial.
-	if truncated {
-		messages = append(messages, fantasy.Message{
-			Role:    fantasy.MessageRoleSystem,
-			Content: []fantasy.MessagePart{fantasy.TextPart{Text: "Earlier conversation context has been truncated. The following messages are the most recent portion of an ongoing conversation."}},
-		})
-	}
-
 	for _, m := range msgs {
 		switch m.Role {
 		case "user":
@@ -234,6 +217,81 @@ func (a *Agent) buildHistory(sessionID string) ([]fantasy.Message, error) {
 		}
 	}
 	return messages, nil
+}
+
+// compactHistory summarizes old messages using the small model when history
+// exceeds maxHistory. Returns the compacted history.
+func (a *Agent) compactHistory(ctx context.Context, history []fantasy.Message) ([]fantasy.Message, error) {
+	if a.maxHistory <= 0 || len(history) <= a.maxHistory {
+		return history, nil
+	}
+
+	a.mu.Lock()
+	smallID := a.smallModel
+	a.mu.Unlock()
+
+	if smallID == "" {
+		// No small model configured, fall back to simple truncation.
+		history = history[len(history)-a.maxHistory:]
+		history = append([]fantasy.Message{{
+			Role:    fantasy.MessageRoleSystem,
+			Content: []fantasy.MessagePart{fantasy.TextPart{Text: "Earlier conversation context has been truncated. The following messages are the most recent portion of an ongoing conversation."}},
+		}}, history...)
+		return history, nil
+	}
+
+	// Split into old (to summarize) and recent (to keep).
+	cutoff := len(history) - a.maxHistory
+	oldMessages := history[:cutoff]
+	recentMessages := history[cutoff:]
+
+	// Format old messages for summarization.
+	var buf strings.Builder
+	for _, m := range oldMessages {
+		switch m.Role {
+		case fantasy.MessageRoleUser:
+			buf.WriteString("User: ")
+		case fantasy.MessageRoleAssistant:
+			buf.WriteString("Assistant: ")
+		case fantasy.MessageRoleTool:
+			buf.WriteString("Tool: ")
+		case fantasy.MessageRoleSystem:
+			buf.WriteString("System: ")
+		}
+		for _, part := range m.Content {
+			if t, ok := part.(fantasy.TextPart); ok {
+				buf.WriteString(t.Text)
+			}
+		}
+		buf.WriteString("\n")
+	}
+
+	smallModel, err := a.provider.LanguageModel(ctx, smallID)
+	if err != nil {
+		return nil, fmt.Errorf("small model %q: %w", smallID, err)
+	}
+
+	summarizer := fantasy.NewAgent(smallModel,
+		fantasy.WithSystemPrompt("You are a conversation summarizer. Summarize the following conversation history concisely, preserving key facts, decisions, code changes, and context needed to continue the conversation. Output only the summary, no preamble."),
+	)
+
+	result, err := summarizer.Generate(ctx, fantasy.AgentCall{
+		Prompt: buf.String(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("summarize history: %w", err)
+	}
+
+	summary := strings.TrimSpace(result.Response.Content.Text())
+
+	// Build compacted history: summary + recent messages.
+	compacted := make([]fantasy.Message, 0, 1+len(recentMessages))
+	compacted = append(compacted, fantasy.Message{
+		Role:    fantasy.MessageRoleSystem,
+		Content: []fantasy.MessagePart{fantasy.TextPart{Text: "Conversation summary (earlier messages were compacted):\n" + summary}},
+	})
+	compacted = append(compacted, recentMessages...)
+	return compacted, nil
 }
 
 // Run executes an agent request, streaming notifications via the JSON-RPC server.
@@ -266,6 +324,12 @@ func (a *Agent) Run(ctx context.Context, srv *jsonrpc.Server, req Request) (*Res
 	history, err := a.buildHistory(sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("load history: %w", err)
+	}
+
+	// Compact history if it exceeds limit (summarizes old messages via small model).
+	history, err = a.compactHistory(ctx, history)
+	if err != nil {
+		return nil, fmt.Errorf("compact history: %w", err)
 	}
 
 	model, err := a.provider.LanguageModel(ctx, modelID)
