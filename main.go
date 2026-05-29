@@ -290,6 +290,28 @@ func main() {
 		return map[string]string{"status": "ok"}, nil
 	})
 
+	// ── set.cwd ──────────────────────────────────────────────
+	srv.Register("set.cwd", func(s *jsonrpc.Server, params json.RawMessage) (interface{}, error) {
+		var req struct {
+			Cwd string `json:"cwd"`
+		}
+		if err := json.Unmarshal(params, &req); err != nil {
+			return nil, &jsonrpc.ErrorObject{
+				Code:    jsonrpc.InvalidParams,
+				Message: "Invalid params",
+				Data:    err.Error(),
+			}
+		}
+		if err := os.Chdir(req.Cwd); err != nil {
+			return nil, &jsonrpc.ErrorObject{
+				Code:    jsonrpc.InternalError,
+				Message: "Failed to change directory",
+				Data:    err.Error(),
+			}
+		}
+		return map[string]string{"cwd": req.Cwd}, nil
+	})
+
 	// ── ping ─────────────────────────────────────────────────
 	srv.Register("ping", func(s *jsonrpc.Server, params json.RawMessage) (interface{}, error) {
 		return "pong", nil

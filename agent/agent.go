@@ -158,14 +158,22 @@ func (a *Agent) GetMultimodalModel() string {
 	return a.multimodalModel
 }
 
-// GetModels returns the current model configuration.
-func (a *Agent) GetModels() map[string]string {
+// GetModels returns the current model configuration plus available models.
+func (a *Agent) GetModels() map[string]any {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return map[string]string{
+	available := make(map[string]map[string]any, len(a.modelInfo))
+	for id, info := range a.modelInfo {
+		available[id] = map[string]any{
+			"contextWindow": info.ContextWindow,
+			"maxOutput":     info.MaxOutput,
+		}
+	}
+	return map[string]any{
 		"primary":    a.defaultModel,
 		"small":      a.smallModel,
 		"multimodal": a.multimodalModel,
+		"available":  available,
 	}
 }
 
@@ -648,6 +656,10 @@ func (a *Agent) Run(ctx context.Context, srv *jsonrpc.Server, req Request) (*Res
 		},
 
 		OnToolCall: func(tc fantasy.ToolCallContent) error {
+			// Persist tool call to session history.
+			if _, err := a.database.AddMessageWithTool(sessionID, "assistant", tc.Input, modelID, tc.ToolName, tc.ToolCallID); err != nil {
+				return fmt.Errorf("save tool call: %w", err)
+			}
 			return notify("chat.toolCall", tools.ToolCallNotification{
 				ToolName: tc.ToolName,
 				Input:    json.RawMessage(tc.Input),
@@ -662,6 +674,10 @@ func (a *Agent) Run(ctx context.Context, srv *jsonrpc.Server, req Request) (*Res
 			} else if errRes, ok := fantasy.AsToolResultOutputType[fantasy.ToolResultOutputContentError](res.Result); ok {
 				output = errRes.Error.Error()
 				isError = true
+			}
+			// Persist tool result to session history.
+			if _, err := a.database.AddMessageWithTool(sessionID, "tool", output, "", res.ToolName, res.ToolCallID); err != nil {
+				return fmt.Errorf("save tool result: %w", err)
 			}
 			return notify("chat.toolResult", tools.ToolResultNotification{
 				ToolName: res.ToolName,
