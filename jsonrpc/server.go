@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 )
 
 type Request struct {
@@ -50,20 +51,24 @@ const (
 type HandlerFunc func(s *Server, params json.RawMessage) (interface{}, error)
 
 type Server struct {
-	r       io.Reader
-	w       io.Writer
-	enc     *json.Encoder
-	mu      sync.Mutex
-	wg      sync.WaitGroup
-	methods map[string]HandlerFunc
+	r              io.Reader
+	w              io.Writer
+	enc            *json.Encoder
+	mu             sync.Mutex
+	wg             sync.WaitGroup
+	methods        map[string]HandlerFunc
+	pendingReqMu   sync.Mutex
+	pendingReq     map[int]chan json.RawMessage
+	reqCounter     atomic.Int32
 }
 
 func New(r io.Reader, w io.Writer) *Server {
 	return &Server{
-		r:       r,
-		w:       w,
-		enc:     json.NewEncoder(w),
-		methods: make(map[string]HandlerFunc),
+		r:          r,
+		w:          w,
+		enc:        json.NewEncoder(w),
+		methods:    make(map[string]HandlerFunc),
+		pendingReq: make(map[int]chan json.RawMessage),
 	}
 }
 
@@ -83,17 +88,89 @@ func (s *Server) Notify(method string, params interface{}) error {
 	})
 }
 
+// Request sends a JSON-RPC request to the client and waits for the response. Thread-safe.
+func (s *Server) Request(method string, params interface{}) (json.RawMessage, error) {
+	id := int(s.reqCounter.Add(1))
+	ch := make(chan json.RawMessage, 1)
+
+	s.pendingReqMu.Lock()
+	s.pendingReq[id] = ch
+	s.pendingReqMu.Unlock()
+
+	defer func() {
+		s.pendingReqMu.Lock()
+		delete(s.pendingReq, id)
+		s.pendingReqMu.Unlock()
+	}()
+
+	s.mu.Lock()
+	err := s.enc.Encode(Request{
+		JSONRPC: "2.0",
+		Method:  method,
+		Params:  mustMarshal(params),
+		ID:      &id,
+	})
+	s.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+
+	resp := <-ch
+	// Check if the response is an error.
+	var envelope struct {
+		Result json.RawMessage `json:"result"`
+		Error  *ErrorObject    `json:"error"`
+	}
+	if err := json.Unmarshal(resp, &envelope); err != nil {
+		return nil, fmt.Errorf("invalid response: %w", err)
+	}
+	if envelope.Error != nil {
+		return nil, envelope.Error
+	}
+	return envelope.Result, nil
+}
+
+func mustMarshal(v interface{}) json.RawMessage {
+	b, _ := json.Marshal(v)
+	return b
+}
+
 // Listen reads requests from stdin and writes responses to stdout. Blocks until EOF.
 func (s *Server) Listen() error {
 	dec := json.NewDecoder(s.r)
 
 	for {
-		var req Request
-		if err := dec.Decode(&req); err != nil {
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
 			if err == io.EOF {
 				s.wg.Wait()
 				return nil
 			}
+			s.writeError(nil, ParseError, "Parse error", nil)
+			continue
+		}
+
+		// Detect if this is a response (has "id" + "result"/"error", no "method")
+		var probe struct {
+			ID     *int            `json:"id"`
+			Method string          `json:"method"`
+			Result json.RawMessage `json:"result"`
+			Error  *ErrorObject    `json:"error"`
+		}
+		if err := json.Unmarshal(raw, &probe); err == nil && probe.ID != nil && probe.Method == "" {
+			// This is a response to a server-initiated request.
+			s.pendingReqMu.Lock()
+			ch, ok := s.pendingReq[*probe.ID]
+			s.pendingReqMu.Unlock()
+			if ok {
+				ch <- raw
+			}
+			continue
+		}
+
+		// Otherwise it's a client request.
+		var req Request
+		if err := json.Unmarshal(raw, &req); err != nil {
 			s.writeError(nil, ParseError, "Parse error", nil)
 			continue
 		}

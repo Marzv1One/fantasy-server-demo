@@ -605,7 +605,11 @@ func (a *Agent) Run(ctx context.Context, srv *jsonrpc.Server, req Request) (*Res
 		return srv.Notify(method, params)
 	}
 
-	agentTools := tools.RegisterAll(notify)
+	request := func(method string, params interface{}) (json.RawMessage, error) {
+		return srv.Request(method, params)
+	}
+
+	agentTools := tools.RegisterAll(notify, request)
 
 	ag := fantasy.NewAgent(model,
 		fantasy.WithSystemPrompt(systemPrompt),

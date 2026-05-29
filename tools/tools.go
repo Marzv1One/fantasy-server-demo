@@ -15,12 +15,15 @@ import (
 // NotifyFunc is called to send a JSON-RPC notification to the client.
 type NotifyFunc func(method string, params interface{}) error
 
+// RequestFunc sends a JSON-RPC request to the client and waits for the response.
+type RequestFunc func(method string, params interface{}) (json.RawMessage, error)
+
 // RegisterAll registers all built-in tools on the given agent options slice
 // and returns the updated slice.
-func RegisterAll(notify NotifyFunc) []fantasy.AgentTool {
+func RegisterAll(notify NotifyFunc, request RequestFunc) []fantasy.AgentTool {
 	return []fantasy.AgentTool{
 		FileRead(notify),
-		FileWrite(notify),
+		FileWrite(notify, request),
 		Shell(notify),
 	}
 }
@@ -46,10 +49,35 @@ type fileWriteInput struct {
 }
 
 // FileWrite returns a tool that writes content to a file.
-// Sends a notification before and after the write so the editor can react.
-func FileWrite(notify NotifyFunc) fantasy.AgentTool {
+// Reads the existing file, sends a confirmation request with old+new content,
+// and only writes after the user accepts.
+func FileWrite(notify NotifyFunc, request RequestFunc) fantasy.AgentTool {
 	return fantasy.NewAgentTool("file_write", "Write content to a file, creating directories as needed", func(ctx context.Context, input fileWriteInput, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
 		abs, _ := filepath.Abs(input.Path)
+
+		// Read existing content for diff.
+		var oldContent string
+		if data, err := os.ReadFile(abs); err == nil {
+			oldContent = string(data)
+		}
+
+		// Send confirmation request to client and wait.
+		resp, err := request("file.confirm", map[string]any{
+			"id":          abs,
+			"path":        abs,
+			"oldContent":  oldContent,
+			"newContent":  input.Content,
+		})
+		if err != nil {
+			return fantasy.NewTextErrorResponse(fmt.Sprintf("write cancelled: %s", err)), nil
+		}
+
+		var result struct {
+			Accepted bool `json:"accepted"`
+		}
+		if err := json.Unmarshal(resp, &result); err != nil || !result.Accepted {
+			return fantasy.NewTextErrorResponse("write cancelled by user"), nil
+		}
 
 		// Notify editor before write.
 		notify("file.willChange", map[string]any{
