@@ -24,7 +24,7 @@ func RegisterAll(notify NotifyFunc, request RequestFunc) []fantasy.AgentTool {
 	return []fantasy.AgentTool{
 		FileRead(notify),
 		FileWrite(notify, request),
-		Shell(notify),
+		Shell(notify, request),
 	}
 }
 
@@ -108,8 +108,25 @@ type shellInput struct {
 }
 
 // Shell returns a tool that runs a shell command.
-func Shell(notify NotifyFunc) fantasy.AgentTool {
+// Sends a confirmation request before execution.
+func Shell(notify NotifyFunc, request RequestFunc) fantasy.AgentTool {
 	return fantasy.NewAgentTool("shell", "Execute a shell command and return stdout+stderr", func(ctx context.Context, input shellInput, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
+		// Send confirmation request to client and wait.
+		resp, err := request("shell.confirm", map[string]any{
+			"command": input.Command,
+			"dir":     input.Dir,
+		})
+		if err != nil {
+			return fantasy.NewTextErrorResponse(fmt.Sprintf("shell cancelled: %s", err)), nil
+		}
+
+		var result struct {
+			Accepted bool `json:"accepted"`
+		}
+		if err := json.Unmarshal(resp, &result); err != nil || !result.Accepted {
+			return fantasy.NewTextErrorResponse("shell cancelled by user"), nil
+		}
+
 		notify("shell.executing", map[string]any{
 			"command": input.Command,
 		})

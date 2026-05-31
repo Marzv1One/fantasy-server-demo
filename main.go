@@ -264,6 +264,7 @@ func main() {
 		case "multimodal":
 			ag.SetMultimodalModel(req.Model)
 		default:
+			req.Role = "primary"
 			ag.SetDefaultModel(req.Model)
 		}
 		return map[string]string{"role": req.Role, "model": req.Model}, nil

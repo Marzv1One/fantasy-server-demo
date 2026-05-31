@@ -260,15 +260,38 @@ func (a *Agent) buildHistory(sessionID string) ([]fantasy.Message, error) {
 		case "user":
 			messages = append(messages, fantasy.NewUserMessage(m.Content))
 		case "assistant":
-			messages = append(messages, fantasy.Message{
-				Role:    fantasy.MessageRoleAssistant,
-				Content: []fantasy.MessagePart{fantasy.TextPart{Text: m.Content}},
-			})
+			if m.ToolName != "" {
+				// Reconstruct structured tool call.
+				messages = append(messages, fantasy.Message{
+					Role: fantasy.MessageRoleAssistant,
+					Content: []fantasy.MessagePart{fantasy.ToolCallPart{
+						ToolCallID: m.ToolCallID,
+						ToolName:   m.ToolName,
+						Input:      m.Content,
+					}},
+				})
+			} else {
+				messages = append(messages, fantasy.Message{
+					Role:    fantasy.MessageRoleAssistant,
+					Content: []fantasy.MessagePart{fantasy.TextPart{Text: m.Content}},
+				})
+			}
 		case "tool":
-			messages = append(messages, fantasy.Message{
-				Role:    fantasy.MessageRoleTool,
-				Content: []fantasy.MessagePart{fantasy.TextPart{Text: m.Content}},
-			})
+			if m.ToolName != "" {
+				// Reconstruct structured tool result.
+				messages = append(messages, fantasy.Message{
+					Role: fantasy.MessageRoleTool,
+					Content: []fantasy.MessagePart{fantasy.ToolResultPart{
+						ToolCallID: m.ToolCallID,
+						Output:     fantasy.ToolResultOutputContentText{Text: m.Content},
+					}},
+				})
+			} else {
+				messages = append(messages, fantasy.Message{
+					Role:    fantasy.MessageRoleTool,
+					Content: []fantasy.MessagePart{fantasy.TextPart{Text: m.Content}},
+				})
+			}
 		}
 	}
 	return messages, nil
