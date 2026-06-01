@@ -1,6 +1,7 @@
 package jsonrpc
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -128,6 +129,51 @@ func (s *Server) Request(method string, params interface{}) (json.RawMessage, er
 		return nil, envelope.Error
 	}
 	return envelope.Result, nil
+}
+
+// RequestWithContext sends a JSON-RPC request and waits for the response or context cancellation.
+func (s *Server) RequestWithContext(ctx context.Context, method string, params interface{}) (json.RawMessage, error) {
+	id := int(s.reqCounter.Add(1))
+	ch := make(chan json.RawMessage, 1)
+
+	s.pendingReqMu.Lock()
+	s.pendingReq[id] = ch
+	s.pendingReqMu.Unlock()
+
+	defer func() {
+		s.pendingReqMu.Lock()
+		delete(s.pendingReq, id)
+		s.pendingReqMu.Unlock()
+	}()
+
+	s.mu.Lock()
+	err := s.enc.Encode(Request{
+		JSONRPC: "2.0",
+		Method:  method,
+		Params:  mustMarshal(params),
+		ID:      &id,
+	})
+	s.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case resp := <-ch:
+		var envelope struct {
+			Result json.RawMessage `json:"result"`
+			Error  *ErrorObject    `json:"error"`
+		}
+		if err := json.Unmarshal(resp, &envelope); err != nil {
+			return nil, fmt.Errorf("invalid response: %w", err)
+		}
+		if envelope.Error != nil {
+			return nil, envelope.Error
+		}
+		return envelope.Result, nil
+	}
 }
 
 func mustMarshal(v interface{}) json.RawMessage {

@@ -628,8 +628,8 @@ func (a *Agent) Run(ctx context.Context, srv *jsonrpc.Server, req Request) (*Res
 		return srv.Notify(method, params)
 	}
 
-	request := func(method string, params interface{}) (json.RawMessage, error) {
-		return srv.Request(method, params)
+	request := func(reqCtx context.Context, method string, params interface{}) (json.RawMessage, error) {
+		return srv.RequestWithContext(reqCtx, method, params)
 	}
 
 	agentTools := tools.RegisterAll(notify, request)

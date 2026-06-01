@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 
 	"github.com/user/jsonrpc-server/agent"
 	"github.com/user/jsonrpc-server/db"
@@ -51,9 +52,18 @@ func main() {
 	}
 
 	srv := jsonrpc.New(os.Stdin, os.Stdout)
+	var chatBusy atomic.Bool
 
 	// ── chat.send ────────────────────────────────────────────
 	srv.Register("chat.send", func(s *jsonrpc.Server, params json.RawMessage) (interface{}, error) {
+		if !chatBusy.CompareAndSwap(false, true) {
+			return nil, &jsonrpc.ErrorObject{
+				Code:    -32050,
+				Message: "Server is busy — a request is already in progress",
+			}
+		}
+		defer chatBusy.Store(false)
+
 		var req agent.Request
 		if err := json.Unmarshal(params, &req); err != nil {
 			return nil, &jsonrpc.ErrorObject{
