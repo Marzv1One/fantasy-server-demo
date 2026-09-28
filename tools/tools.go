@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -240,7 +241,12 @@ func Shell(notify NotifyFunc, request ContextRequestFunc) fantasy.AgentTool {
 			"command": input.Command,
 		})
 
-		cmd := exec.CommandContext(ctx, "sh", "-c", input.Command)
+		var cmd *exec.Cmd
+		if runtime.GOOS == "windows" {
+			cmd = exec.CommandContext(ctx, "cmd", "/C", input.Command)
+		} else {
+			cmd = exec.CommandContext(ctx, "sh", "-c", input.Command)
+		}
 		if input.Dir != "" {
 			cmd.Dir = input.Dir
 		}
